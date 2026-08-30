@@ -1,0 +1,5 @@
+{"timestamp":"2026-06-19 15:00:00.000000-0700","process":"apsd","subsystem":"com.apple.apsd","messageType":"Info","eventMessage":"Received notification for topic com.apple.mgmt.External.aabbccdd","traceID":"t-101"}
+{"timestamp":"2026-06-19 15:00:01.000000-0700","process":"mdmclient","subsystem":"com.apple.ManagedClient","messageType":"Default","eventMessage":"Received MDM command: CommandUUID=CCC-333 RequestType=InstallApplication","traceID":"t-102"}
+{"timestamp":"2026-06-19 15:00:02.000000-0700","process":"mdmclient","subsystem":"com.apple.ManagedClient","messageType":"Default","eventMessage":"Sending response: Status=NotNow CommandUUID=CCC-333 device is locked","traceID":"t-103"}
+{"timestamp":"2026-06-19 15:00:20.000000-0700","process":"mdmclient","subsystem":"com.apple.ManagedClient","messageType":"Default","eventMessage":"Sending response: Status=NotNow CommandUUID=CCC-333 device is locked","traceID":"t-104"}
+{"timestamp":"2026-06-19 15:00:25.000000-0700","process":"mdmclient","subsystem":"com.apple.ManagedClient","messageType":"Default","eventMessage":"Processing CommandUUID=CCC-333 payload <private>","traceID":"t-105"}

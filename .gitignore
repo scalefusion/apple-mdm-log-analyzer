@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.DS_Store
+# Editor / tool caches — must not leak into published sdist
+.claude/
+.idea/
+.vscode/

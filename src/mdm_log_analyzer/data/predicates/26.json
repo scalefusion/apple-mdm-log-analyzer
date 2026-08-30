@@ -1,0 +1,57 @@
+{
+  "os_major": 26,
+  "note": "macOS 26 (Tahoe). Validated against build 25F80 across two DDM-active devices. mdm_command returns live mdmclient/ManagedClient events. DDM declarative subsystems are now PINNED (see ddm entry). Command status/type ride in a check-in bracket '[Status(CommandType):n]' (e.g. [Acknowledged(InstallProfile):0]) rather than CommandUUID=/RequestType=/Status= \u2014 normalize.py is tuned for this. No command UUID is exposed even with the private-data logging profile on, so correlation on macOS 26 is time+type, not UUID.",
+  "categories": {
+    "mdm_command": {
+      "predicate": "processImagePath CONTAINS \"mdmclient\" OR subsystem CONTAINS \"com.apple.ManagedClient\"",
+      "level": "debug",
+      "confidence": "high",
+      "note": "Confirmed returning events on 25F80."
+    },
+    "enrollment": {
+      "predicate": "subsystem CONTAINS \"com.apple.ManagedClient.cloudconfigurationd\" OR process == \"cloudconfigurationd\" OR (processImagePath CONTAINS \"mdmclient\" AND (eventMessage CONTAINS \"MDM_Authenticate\" OR eventMessage CONTAINS \"MDM_TokenUpdate\" OR eventMessage CONTAINS \"MDM_CheckOut\" OR eventMessage CONTAINS \"MDM_SCEP_Enroll\" OR eventMessage CONTAINS \"Enrolling MDM\" OR eventMessage CONTAINS \"Unenrolling\" OR eventMessage CONTAINS \"DeviceEnrollment\"))",
+      "level": "debug",
+      "confidence": "high",
+      "note": "cloudconfigurationd covers DEP/ADE only. A MANUAL profile enrollment never touches it, so this category returned 0 events for a real failed manual enrollment while the failure (HTTP 401 on MDM_Authenticate, after SCEP succeeded) sat in mdmclient's own check-in lines. Those are now in scope. Keep in sync with the enrollment step in tools/collect-mdm-logs.sh."
+    },
+    "push": {
+      "predicate": "process == \"apsd\"",
+      "level": "info",
+      "confidence": "high"
+    },
+    "scheduling": {
+      "predicate": "process == \"dasd\"",
+      "level": "debug",
+      "confidence": "medium"
+    },
+    "asset_download": {
+      "predicate": "process == \"storedownloadd\" OR process == \"appstored\" OR subsystem == \"com.apple.appstored\" OR subsystem == \"com.apple.AppStoreDaemon\"",
+      "level": "debug",
+      "confidence": "high",
+      "note": "A device-assigned VPP/App Store install on macOS 26/27 is carried by appstored (subsystem com.apple.appstored), not storedownloadd: a real 27.0 (26A5416b) managed-install capture logged 0 storedownloadd events while appstored did all the download and hand-off work. storedownloadd is kept for the older/manifest-URL path."
+    },
+    "ddm": {
+      "predicate": "subsystem CONTAINS \"com.apple.dmd\" OR subsystem CONTAINS \"remotemanagementd\" OR subsystem CONTAINS \"ManagedAppDistribution\" OR subsystem CONTAINS \"SoftwareUpdateMacController\" OR processImagePath CONTAINS \"mdmclient\"",
+      "level": "debug",
+      "confidence": "high",
+      "note": "Declarative subsystems pinned empirically on 25F80 across two DDM-active devices: com.apple.dmd (declarative mgmt daemon), com.apple.remotemanagementd, com.apple.ManagedAppDistribution, com.apple.SoftwareUpdateMacController. mdmclient retained for the DeclarativeManagement command round-trip; de-dupe by raw_ref against mdm_command."
+    },
+    "declaration": {
+      "predicate": "process == \"remotemanagementd\" OR subsystem CONTAINS \"remotemanagementd\" OR subsystem CONTAINS \"com.apple.dmd\" OR subsystem CONTAINS \"SoftwareUpdateMacController\" OR subsystem CONTAINS \"ManagedAppDistribution\"",
+      "level": "info",
+      "confidence": "high",
+      "note": "DDM declaration state for get_ddm_status \u2014 declarative subsystems only (no mdmclient, unlike the ddm category). remotemanagementd is the status/activation engine on 25F80."
+    },
+    "pkg_install": {
+      "predicate": "process == \"installd\" OR process == \"installer\" OR process == \"system_installd\" OR subsystem == \"com.apple.install\"",
+      "level": "debug",
+      "confidence": "high",
+      "note": "Added system_installd: observed handling PackageKit installs alongside installd on 25F80."
+    },
+    "profile_payload": {
+      "predicate": "process == \"profiles\" OR processImagePath CONTAINS \"mdmclient\"",
+      "level": "debug",
+      "confidence": "medium"
+    }
+  }
+}

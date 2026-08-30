@@ -1,0 +1,94 @@
+# CI for mdm-log-analyzer.
+#
+#  test:   runs on every push and pull request. Two suites, deliberately:
+#          the engine suite is stdlib-only and needs no install, while the
+#          server smoke test needs the real `mcp` SDK — it is the job that
+#          catches an SDK breaking change before a user does. Without it
+#          nothing in CI ever imports server.py.
+#  build:  produces a wheel artifact so a tester can grab it from the run
+#          without any registry or credentials.
+#  release: on a semver tag, attaches the wheel and sdist to a GitHub Release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor declared in pyproject; test the ends of the range.
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Engine suite (stdlib only, no install)
+        run: python3 tests/test_engine.py
+      - name: Install the package (brings in the mcp SDK)
+        run: pip install --quiet -e .
+      - name: Server smoke test (real stdio transport)
+        run: python3 tests/test_server_smoke.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 30
+
+  release:
+    # Only on a semver tag — a stray tag like "wip" must not cut a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # required to create the Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Attach the wheel and sdist to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+# Publishing to PyPI is NOT wired up. When you want it, add a job gated on the
+# same tag condition using PyPI Trusted Publishing (OIDC) rather than a stored
+# token:
+#
+#   pypi:
+#     if: startsWith(github.ref, 'refs/tags/v')
+#     needs: build
+#     runs-on: ubuntu-latest
+#     environment: pypi
+#     permissions:
+#       id-token: write
+#     steps:
+#       - uses: actions/download-artifact@v4
+#         with: { name: dist, path: dist }
+#       - uses: pypa/gh-action-pypi-publish@release/v1
+#
+# Trusted Publishing needs a one-time setup on pypi.org (Publisher: this repo,
+# workflow ci.yml, environment pypi) and stores no long-lived credential.

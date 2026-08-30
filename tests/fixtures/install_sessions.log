@@ -1,0 +1,17 @@
+2026-08-06 17:45:59+05:30 host system_installd[29039]: PackageKit: ----- Begin install -----
+2026-08-06 17:45:59+05:30 host system_installd[29039]: PackageKit: request=PKInstallRequest <1 packages, destination=/>
+2026-08-06 17:45:59+05:30 host system_installd[29039]: PackageKit: packages=(
+	    "PKLeopardPackage <id=com.acme.agent, version=3.4.1, url=file:///Library/Updates/acme-agent.pkg>"
+	)
+2026-08-06 17:46:00+05:30 host system_installd[29039]: PackageKit: Executing script "preinstall" in /Library/InstallerSandboxes
+2026-08-06 17:46:01+05:30 host system_installd[29039]: PackageKit: Writing system content receipt for com.acme.agent to /
+2026-08-06 17:46:03+05:30 host system_installd[29039]: PackageKit: ----- End install -----
+2026-08-06 17:50:10-04 host installd[31000]: PackageKit: ----- Begin install -----
+2026-08-06 17:50:10-04 host installd[31000]: PackageKit: packages=(
+	    "PKLeopardPackage <id=com.acme.broken, version=1.0.0, url=file:///tmp/broken.pkg>"
+	)
+2026-08-06 17:50:12-04 host package_script_service[31005]: PackageKit: Executing script "postinstall" for com.acme.broken
+2026-08-06 17:50:13-04 host installd[31000]: PackageKit: Install Failed: script exited with status 77
+2026-08-06 17:50:14-04 host installd[31000]: PackageKit: ----- End install -----
+2026-08-06 18:00:00+05:30 host installd[32000]: PackageKit: ----- Begin install -----
+2026-08-06 18:00:00+05:30 host installd[32000]: PackageKit: Extracting file:///Users/someone/Downloads/orphan.pkg (destination=/)

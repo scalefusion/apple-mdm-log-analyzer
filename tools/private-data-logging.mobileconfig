@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MDM Private-Data Logging profile (spec §4.5).
+
+  By default macOS redacts MDM command detail (CommandUUID, RequestType, Status,
+  payload bodies) as <private> in the unified log. This profile unmasks it so the
+  analyzer's normalize.py can extract command fields and correlate round-trips.
+
+  INSTALL (on the SOURCE Mac, before running collect-mdm-logs.sh):
+    1. Copy this file to that Mac and double-click it.
+    2. System Settings ▸ General ▸ Device Management (or Privacy & Security ▸
+       Profiles) ▸ approve "MDM Private Data Logging".
+    3. Reproduce/trigger the MDM activity, then run collect-mdm-logs.sh.
+
+  SECURITY: this enables private-data logging system-wide, not just for MDM, so
+  the captured logs are MORE sensitive (that is exactly why the analyzer's
+  redaction layer is mandatory). REMOVE the profile afterward: System Settings ▸
+  Profiles ▸ select ▸ remove.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key>
+      <string>com.apple.system.logging</string>
+      <key>PayloadIdentifier</key>
+      <string>com.mdmloganalyzer.logging.private</string>
+      <key>PayloadUUID</key>
+      <string>0B6E9C7A-3D21-4F8E-9C1A-7A2B5E0D4C11</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>PayloadDisplayName</key>
+      <string>MDM Private Data Logging</string>
+      <key>System</key>
+      <dict>
+        <key>Enable-Private-Data</key>
+        <true/>
+      </dict>
+    </dict>
+  </array>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadIdentifier</key>
+  <string>com.mdmloganalyzer.logging</string>
+  <key>PayloadUUID</key>
+  <string>F3A1D2C4-5B67-48E9-AA0C-1E2F3A4B5C6D</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+  <key>PayloadDisplayName</key>
+  <string>MDM Private Data Logging (mdm-log-analyzer)</string>
+  <key>PayloadDescription</key>
+  <string>Unmasks &lt;private&gt; MDM/DDM detail in the unified log for diagnostics. Remove after collecting logs.</string>
+  <key>PayloadScope</key>
+  <string>System</string>
+</dict>
+</plist>

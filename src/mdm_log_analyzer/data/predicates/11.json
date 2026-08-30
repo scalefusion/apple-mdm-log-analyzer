@@ -1,0 +1,55 @@
+{
+  "os_major": 11,
+  "note": "macOS 11 (Big Sur). Validated against build 20G1427: mdmclient already uses the '[Status(CommandType):n]' check-in bracket (e.g. [Acknowledged(InstallProfile):0], [Error(RemoveProfile):0]) with NO CommandUUID \u2014 identical to 14/15/26, so normalize.py extraction works unchanged and correlation is time+type. Big Sur PREDATES Declarative Device Management, so the ddm category effectively matches nothing real here; the daemon-based predicate is retained (harmless on 11) so that macOS 12/13, which resolve to this file by fallback, still match their DDM daemons.",
+  "categories": {
+    "mdm_command": {
+      "predicate": "processImagePath CONTAINS \"mdmclient\" OR subsystem CONTAINS \"com.apple.ManagedClient\"",
+      "level": "debug",
+      "confidence": "high"
+    },
+    "enrollment": {
+      "predicate": "subsystem CONTAINS \"com.apple.ManagedClient.cloudconfigurationd\" OR process == \"cloudconfigurationd\" OR (processImagePath CONTAINS \"mdmclient\" AND (eventMessage CONTAINS \"MDM_Authenticate\" OR eventMessage CONTAINS \"MDM_TokenUpdate\" OR eventMessage CONTAINS \"MDM_CheckOut\" OR eventMessage CONTAINS \"MDM_SCEP_Enroll\" OR eventMessage CONTAINS \"Enrolling MDM\" OR eventMessage CONTAINS \"Unenrolling\" OR eventMessage CONTAINS \"DeviceEnrollment\"))",
+      "level": "debug",
+      "confidence": "high",
+      "note": "cloudconfigurationd covers DEP/ADE only. A MANUAL profile enrollment never touches it, so this category returned 0 events for a real failed manual enrollment while the failure (HTTP 401 on MDM_Authenticate, after SCEP succeeded) sat in mdmclient's own check-in lines. Those are now in scope. Keep in sync with the enrollment step in tools/collect-mdm-logs.sh."
+    },
+    "push": {
+      "predicate": "process == \"apsd\"",
+      "level": "info",
+      "confidence": "high"
+    },
+    "scheduling": {
+      "predicate": "process == \"dasd\"",
+      "level": "debug",
+      "confidence": "medium"
+    },
+    "asset_download": {
+      "predicate": "process == \"storedownloadd\" OR process == \"appstored\" OR subsystem == \"com.apple.appstored\" OR subsystem == \"com.apple.AppStoreDaemon\"",
+      "level": "debug",
+      "confidence": "medium",
+      "note": "A device-assigned VPP/App Store install on macOS 26/27 is carried by appstored (subsystem com.apple.appstored), not storedownloadd: a real 27.0 (26A5416b) managed-install capture logged 0 storedownloadd events while appstored did all the download and hand-off work. storedownloadd is kept for the older/manifest-URL path."
+    },
+    "ddm": {
+      "predicate": "subsystem CONTAINS \"com.apple.dmd\" OR subsystem CONTAINS \"remotemanagementd\" OR subsystem CONTAINS \"SoftwareUpdateMacController\" OR processImagePath CONTAINS \"mdmclient\"",
+      "level": "debug",
+      "confidence": "low",
+      "note": "N/A on Big Sur (predates DDM). Daemon set retained for the 12/13 fallback chain; confirm if ever pinning a real Monterey/Ventura capture."
+    },
+    "declaration": {
+      "predicate": "process == \"remotemanagementd\" OR subsystem CONTAINS \"remotemanagementd\" OR subsystem CONTAINS \"com.apple.dmd\" OR subsystem CONTAINS \"SoftwareUpdateMacController\"",
+      "level": "info",
+      "confidence": "low",
+      "note": "N/A on Big Sur \u2014 predates DDM, so this matches nothing real. Present for schema parity and the 12/13 fallback chain."
+    },
+    "pkg_install": {
+      "predicate": "process == \"installd\" OR process == \"installer\" OR subsystem == \"com.apple.install\"",
+      "level": "debug",
+      "confidence": "high"
+    },
+    "profile_payload": {
+      "predicate": "process == \"profiles\" OR processImagePath CONTAINS \"mdmclient\"",
+      "level": "debug",
+      "confidence": "medium"
+    }
+  }
+}
