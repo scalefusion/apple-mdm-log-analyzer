@@ -54,10 +54,59 @@ _NON_USER_HOME_DIRS = frozenset({"Shared", "Guest", "Deleted Users", ".localized
 # scrubbing it would hide the very signal that says detail is missing.
 # The optional scheme word matters: without it `Authorization: Bearer <token>`
 # consumes "Bearer" as the value and leaves the token in the clear.
+#
+# The key is matched by its TAIL, not as a whole word. The previous
+# `\b(token|…)\b` form could never fire on a camelCase MDM payload key, because
+# there is no word boundary inside `DeviceToken` — so the highest-value secrets
+# in the protocol all passed through untouched: DeviceToken (the APNs push
+# token), UnlockToken, EscrowKey, AwaitDeviceConfiguredToken. Verified leaking
+# before this change.
+# Two shapes. A bare word that is unambiguous on its own, OR a camelCase /
+# underscored key ENDING in a secret word (DeviceToken, EscrowKey,
+# UnlockToken). The prefixed form requires at least one leading character so
+# that the bare prose word "key" is NOT treated as a secret key — log text
+# says things like "Invalid value type for configuration key: Calculator…",
+# and redacting that destroys the diagnosis it exists to deliver.
+_SECRET_KEY = (
+    r"(?:authorization|bearer|tokens?|passwords?|passwd|passphrase"
+    r"|secrets?|challenge|credentials?|api[_-]?key|private[_-]?key)"
+    r"|(?:[A-Za-z0-9_.-]+(?:tokens?|key|secrets?|passwords?|passphrase"
+    r"|credentials?))"
+)
+# The value is consumed to a STRUCTURAL terminator, not to whitespace. `\S+`
+# stopped at the first space, so `password = "hunter 2 with spaces";` leaked its
+# tail, and `DeviceToken = <8a2f9c1d 4b7e0a33 …>` leaked every group after the
+# first — `log show` prints push tokens as space-separated 8-char groups, each
+# under the 32-char threshold of the hex-blob rule below.
+_SECRET_VALUE = '"[^"\n]*"|\'[^\'\n]*\'|<[^>\n]*>|[^;,\n}]+'
 _RE_SECRET_KV = re.compile(
-    r"(?i)\b(token|bearer|authorization|challenge|password|passwd|passphrase"
-    r"|secret|api[_-]?key|private[_-]?key)\b\s*[=:]\s*"
-    r"(?:(?:Bearer|Basic|Token|Digest)\s+)?(?!<private>)\S+"
+    r"(?i)\b(?P<key>" + _SECRET_KEY + r")\s*[=:](?!\s*<private>)\s*"
+    r"(?:(?:Bearer|Basic|Token|Digest)\s+)?"
+    r"(?P<val>" + _SECRET_VALUE + r")"
+)
+
+# Identifiers redacted by their KEY, not by the shape of their value.
+#
+# normalize.py already recognises `SerialNumber = …` as a serial, hashes it into
+# `Event.device_ref`, and then leaves the plaintext sitting in `Event.message`.
+# The value-shape heuristics below are a backstop for identifiers that appear
+# bare in prose; when the log names the field, that name is the reliable signal.
+# Hashed rather than blanked so two events about one device still correlate.
+_RE_KEYED_IDENT = re.compile(
+    r"(?i)\b(?P<key>SerialNumber|Serial|UDID|ProvisioningUDID|HardwareUUID"
+    r"|IMEI|MEID|ICCID|EID|PushMagic|EnrollmentID|EnrollID"
+    r"|EthernetMAC|WiFiMAC|BluetoothMAC)"
+    r"(?P<sep>\s*[=:]\s*)"
+    r"(?P<val>\"[^\"\n]*\"|'[^'\n]*'|<[^>\n]*>|[^\s;,\n}]+)"
+)
+
+# Server URLs. device_context.py hashes the MDM host into `mdm_server_host`
+# because it IS an identifier — it names the tenant — but with no rule here the
+# same host came back in cleartext from every other tool, which made the hashing
+# cosmetic. The path is dropped, not hashed: a real capture carried a SCEP
+# challenge inside it (`…/apple/scep/TUNMUkQ3…`).
+_RE_URL = re.compile(
+    r"\bhttps?://(?P<host>[A-Za-z0-9._\-]+(?::\d+)?)(?P<path>/[^\s\"',;)\]]*)?"
 )
 
 # MAC addresses, colon or hyphen separated. Must run BEFORE the IPv6 rule, which
@@ -121,6 +170,21 @@ def _sub_uid(m: re.Match) -> str:
     return m.group(1) + m.group(2) + _inline_hash(m.group(3))
 
 
+def _sub_secret(m: re.Match) -> str:
+    return f"{m.group('key')}=<redacted>"
+
+
+def _sub_keyed_ident(m: re.Match) -> str:
+    raw = m.group("val").strip("\"'<>")
+    return m.group("key") + m.group("sep") + _inline_hash(raw)
+
+
+def _sub_url(m: re.Match) -> str:
+    path = m.group("path")
+    tail = "/<redacted-path>" if path and path.rstrip("/") else ""
+    return "https://" + _inline_hash(m.group("host")) + tail
+
+
 def _sub_user_name(m: re.Match) -> str:
     return m.group(1) + m.group(2) + _inline_hash(m.group(3))
 
@@ -130,7 +194,12 @@ def _sub_user_name(m: re.Match) -> str:
 # LOAD-BEARING — see the notes on the MAC/IPv6 and UUID/serial pairs above.
 _SCRUBBERS = (
     # key=value secrets (auth tokens, SCEP challenges, payload passwords)
-    (_RE_SECRET_KV, r"\1=<redacted>"),
+    (_RE_SECRET_KV, _sub_secret),
+    # identifiers named by their key -> stable inline hash. Before the UUID and
+    # serial rules so a keyed value is handled by name rather than by shape.
+    (_RE_KEYED_IDENT, _sub_keyed_ident),
+    # server URLs -> hashed host, path dropped
+    (_RE_URL, _sub_url),
     # hardware UUIDs / UDIDs / declaration instance ids -> stable inline hash
     (_RE_UUID, _sub_uuid),
     # MAC addresses (before IPv6)

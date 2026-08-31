@@ -303,7 +303,12 @@ def test_report_renders_a_pasteable_incident_report():
     # Redaction survives it too — this text gets pasted into a third party.
     assert "C02ABC123DEF" not in md
     assert "admin@example.com" not in md
-    assert "<redacted-serial>" in md
+    # The fixture names the serial by its key (`SerialNumber=…`), so it is
+    # HASHED rather than blanked: two events about one device still correlate,
+    # which a `<redacted-serial>` placeholder cannot do. A serial appearing bare
+    # in prose is still blanked by the value-shape rule — see
+    # test_redaction_covers_every_class_the_docs_promise.
+    assert "h-" in md
 
     # Small enough for any chat box (this fixture is tiny; the caps hold the
     # real ceiling). ~4 chars/token.
@@ -2678,6 +2683,113 @@ def test_missing_push_is_not_reported_when_push_was_not_captured():
         assert "missing_push" not in codes, codes
         # The real failure is still reported.
         assert "command_failures" in codes, codes
+
+
+
+def test_camelcase_mdm_secret_keys_are_redacted():
+    # `\b(token|…)\b` can never fire on a camelCase key: there is no word
+    # boundary inside `DeviceToken`. So the highest-value secrets in the MDM
+    # protocol all passed through untouched. Each string below was verified
+    # leaking before the fix.
+    from mdm_log_analyzer.redact import scrub_message
+
+    leaked = {
+        "APNs push token": "DeviceToken = <8a2f9c1d 4b7e0a33 91ffee02 3b7c8d19>;",
+        "unlock token": 'UnlockToken = "TXlTZWNyZXRVbmxvY2tUb2tlbg==";',
+        "escrow key": "EscrowKey = ABCDEFGHIJKLMNOP;",
+        "await-configured token": "AwaitDeviceConfiguredToken=hunter2secret",
+        "bootstrap token": "BootstrapToken = <deadbeef cafebabe>;",
+    }
+    for label, line in leaked.items():
+        out = scrub_message(line)
+        assert "<redacted>" in out, f"{label} not redacted: {out!r}"
+        for secret in ("8a2f9c1d", "TXlTZWNyZXRVbmxvY2tUb2tlbg", "ABCDEFGHIJKLMNOP",
+                       "hunter2secret", "deadbeef"):
+            assert secret not in out, f"{label} leaked {secret}: {out!r}"
+
+    # The value is consumed to a STRUCTURAL terminator, not to whitespace.
+    # `\S+` stopped at the first space, so a quoted value leaked its tail and a
+    # space-grouped push token leaked every group after the first.
+    out = scrub_message('password = "hunter 2 with spaces";')
+    assert "hunter" not in out and "spaces" not in out, out
+
+    # Still handles the scheme-word form it always did.
+    assert "abc.def.ghi" not in scrub_message("Authorization: Bearer abc.def.ghi")
+
+
+def test_secret_rule_does_not_eat_diagnostic_prose():
+    # The word "key" appears in ordinary log text — "Invalid value type for
+    # configuration key: Calculator.BasicMode.AddSquareRoot" is the entire
+    # diagnosis of an invalid DDM declaration. Treating a bare prose "key" as a
+    # secret key redacted the answer the tool exists to produce.
+    from mdm_log_analyzer.redact import scrub_message
+
+    ddm = ("Invalid value type for configuration key: "
+           "Calculator.BasicMode.AddSquareRoot, setting key "
+           "calculator.forceSquareRootOnBasicCalculator")
+    assert scrub_message(ddm) == ddm
+
+    # macOS's own masking marker must survive — triage keys the
+    # private_data_masked finding off it. The guard must also survive
+    # backtracking: `\s*[=:]\s*(?!<private>)` can give back its space and check
+    # the wrong position.
+    assert "<private>" in scrub_message("challenge: <private>")
+    assert "<private>" in scrub_message("challenge:<private>")
+    assert "<private>" in scrub_message("Keys: <private>")
+
+    # Keychain prose is diagnostic and starts with "Key".
+    kc = "Keychain: Getting identity with ref: <IdentCert: foo>"
+    assert scrub_message(kc) == kc
+
+
+def test_keyed_identifiers_are_redacted_by_key_not_by_value_shape():
+    # normalize.py already recognised `SerialNumber = …` as a serial by its KEY,
+    # hashed it into device_ref, and left the plaintext in message. The
+    # value-shape heuristic is a backstop: it requires both a letter and a digit
+    # (so all-caps words like DEVICELOCKED survive), which drops an all-alpha
+    # serial, and it never matched a hyphenated IMEI.
+    from mdm_log_analyzer.redact import scrub_message
+
+    for line, secret in [
+        ("SerialNumber = FVFXQLMNPQRS;", "FVFXQLMNPQRS"),      # all-alpha serial
+        ("IMEI = 35-209900-176148-1", "35-209900-176148-1"),   # hyphenated
+        ("UDID = ABCDEFGHIJKLMNOPQRST;", "ABCDEFGHIJKLMNOPQRST"),
+        ("PushMagic = QWERTYUIOP;", "QWERTYUIOP"),
+        ("EthernetMAC = notamacaddress;", "notamacaddress"),
+    ]:
+        out = scrub_message(line)
+        assert secret not in out, f"leaked: {out!r}"
+        # Hashed, not blanked, so two events about one device still correlate.
+        assert "h-" in out, out
+
+    # The same value hashes the same way, so correlation survives.
+    a = scrub_message("SerialNumber = FVFXQLMNPQRS;")
+    b = scrub_message("Serial: FVFXQLMNPQRS")
+    assert a.split("h-")[1].rstrip(";") == b.split("h-")[1]
+
+
+def test_mdm_server_url_is_not_returned_in_cleartext():
+    # get_device_context hashes the MDM host into mdm_server_host because it IS
+    # an identifier — it names the tenant — but with no rule here the same host
+    # came back raw from every other tool, which made the hashing cosmetic.
+    from mdm_log_analyzer.redact import hash_id, scrub_message
+
+    out = scrub_message("Calling MDM_Connect for: https://mdm.example-tenant.com/apple/mdm")
+    assert "mdm.example-tenant.com" not in out, out
+    assert "h-" in out
+
+    # The host hashes to the same digest as get_device_context's `h:` form, so a
+    # reader can still tie a message to the reported server.
+    field = hash_id("mdm.example-tenant.com")
+    assert field.split("h:")[1] in out, (field, out)
+
+    # The PATH is dropped, not hashed: a real capture carried a SCEP challenge
+    # inside it.
+    scep = scrub_message(
+        "Processing MDM_SCEP_Enroll for server: https://api.example.com/apple/scep/TUNMUkQ3UGd"
+    )
+    assert "TUNMUkQ3UGd" not in scep, scep
+    assert "<redacted-path>" in scep
 
 
 if __name__ == "__main__":
