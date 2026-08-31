@@ -562,15 +562,24 @@ not private-flagged), but not payloads or some DDM failure detail.
 
 ### `log show` returns nothing on macOS 27 at default level
 
-macOS 27 tightened default-level logging. Run the server with elevated
-privileges for full detail on that OS:
+macOS 27 tightened default-level logging. Pass `--info --debug` and, if you
+still need more, capture with sudo and analyze the *bundle* rather than running
+the server itself as root:
 
 ```bash
-source ~/mdm-analyzer/bin/activate
-sudo "$(which mcp-mdm-log-analyzer)"
+sudo ./tools/collect-mdm-logs.sh 20m        # sudo here, for the capture only
 ```
 
-(Rarely needed in practice — most useful data is still accessible without sudo.)
+Then point the server at the resulting `.tar.gz`. The server stays unprivileged.
+
+> ⚠️ **Do not run the MCP server as root.** It reads a path chosen by a *model*,
+> from arguments the model derived from untrusted log text, so a crafted log line
+> that suggests a path becomes an arbitrary file read — as root, that is the whole
+> disk. A `.json`/`.ndjson` must now look like `log show` output before it is
+> read, which blocks the obvious version of this, but the capture-then-analyze
+> split removes the privilege from the equation entirely. Earlier revisions of
+> this guide recommended `sudo "$(which mcp-mdm-log-analyzer)"`; they should not
+> have.
 
 ### Where do I look for what the tools actually returned?
 

@@ -21,6 +21,18 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet ruff
+      # F821 (undefined name) is the rule that would have caught `Optional`
+      # being used in sources.py without an import.
+      - run: ruff check src tests tools
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -33,12 +45,46 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # Run as scripts first: the engine suite is stdlib-only by design, and
+      # this proves it still is — `pytest` would mask a stray dependency.
       - name: Engine suite (stdlib only, no install)
         run: python3 tests/test_engine.py
       - name: Install the package (brings in the mcp SDK)
         run: pip install --quiet -e .
       - name: Server smoke test (real stdio transport)
         run: python3 tests/test_server_smoke.py
+      # Then via pytest, which is what a contributor runs locally — pyproject
+      # configures testpaths, so the two were not the same run.
+      - name: Same suites under pytest
+        run: pip install --quiet pytest && pytest -q
+
+  # The Ubuntu job cannot touch LiveLogSource, ArchiveLogSource or any `log show`
+  # path — i.e. the version-sensitive code this project exists to manage had zero
+  # automated coverage. macOS runners are free for public repos.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Engine suite
+        run: python3 tests/test_engine.py
+      - run: pip install --quiet -e .
+      - name: Server smoke test
+        run: python3 tests/test_server_smoke.py
+      - name: Live log path — `log show` actually runs here
+        run: |
+          python3 - <<'PY'
+          from mdm_log_analyzer import engine
+          from mdm_log_analyzer.sources import LiveLogSource
+          # A runner is not enrolled, so expect zero MDM events — the point is
+          # that the subprocess path executes and returns a well-formed result
+          # rather than raising.
+          res = engine.query_events(LiveLogSource(os_major=15), "mdm_command", last="5m")
+          assert "count" in res and "events" in res, res
+          print("live log show OK: count =", res["count"])
+          PY
 
   build:
     needs: test
@@ -69,7 +115,9 @@ jobs:
           name: dist
           path: dist
       - name: Attach the wheel and sdist to the Release
-        uses: softprops/action-gh-release@v2
+        # Pinned to a commit SHA, not a moving tag: this is a third-party
+        # action running in a job with `contents: write`. Update deliberately.
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.0.8
         with:
           files: dist/*
           generate_release_notes: true

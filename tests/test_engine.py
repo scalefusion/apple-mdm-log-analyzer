@@ -942,7 +942,8 @@ def test_bundle_tarball_rejects_non_bundle_shape():
 def test_bundle_source_tarball_path_traversal_guard():
     # A tarball with a member trying to escape the extraction root must be
     # rejected — no writing outside the temp dir.
-    import tarfile as _tf, io
+    import tarfile as _tf
+    import io
 
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / "evil.tar.gz"

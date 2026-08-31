@@ -64,3 +64,32 @@ include = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+# `Optional` was used in sources.py and never imported. `from __future__ import
+# annotations` defers evaluation, so nothing failed until something called
+# get_type_hints — exactly the class a linter catches for free. F821 is the rule
+# that would have caught it.
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+# Deliberately narrow to the rules that catch real defects. Enabling "UP"
+# additionally flags 68 `Optional[X]` -> `X | None` rewrites, and "I" flags
+# import ordering — both worth doing, neither worth mixing into a commit that
+# fixes security findings. Widen in a follow-up.
+select = [
+    "F",    # pyflakes — undefined names (F821, the one that mattered), unused imports
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear — mutable defaults, bare except, loop-variable capture
+]
+ignore = [
+    "E501",  # line length is a formatter concern
+    "E402",  # module-level import not at top: tests insert sys.path first
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests build deliberately awkward inputs and import inside functions to keep
+# the engine suite stdlib-only.
+"tests/*" = ["E402", "F401", "B011"]

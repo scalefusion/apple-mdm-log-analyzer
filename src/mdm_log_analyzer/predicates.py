@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 _DATA_DIR = Path(__file__).parent / "data" / "predicates"
 
