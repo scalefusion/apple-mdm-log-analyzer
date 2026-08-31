@@ -31,8 +31,24 @@
 #
 set -euo pipefail
 
+# The bundle is UNREDACTED — the analyzer redacts on read, not on capture — so it
+# must not be world-readable. Under a typical macOS umask the directory and every
+# redirect below landed at 0755/0644, readable by any other local account, which
+# contradicted the PRIVACY note above. 077 makes them 0700/0600.
+umask 077
+
 WINDOW="${1:-3h}"
 SYMPTOM="${2:-all}"
+
+# Validate the window up front. `log show --last` rejects a malformed value, but
+# every capture below ends in `|| true` so the failure was swallowed and the run
+# produced an empty-but-well-formed bundle: os.txt present, *.ndjson present and
+# zero-length, which passes the analyzer's bundle shape check. That is the same
+# silent-no-op class this script's own comments describe fixing twice.
+if ! printf '%s' "$WINDOW" | grep -qE '^[0-9]+[smhd]$'; then
+  echo "Invalid time window '$WINDOW'. Use <number><s|m|h|d>, e.g. 20m, 3h, 1d." >&2
+  exit 2
+fi
 
 # Which capture steps each symptom needs. Keep in sync with _SYMPTOM_PLANS in
 # src/mdm_log_analyzer/engine.py — same routing, applied at capture time.
@@ -186,6 +202,25 @@ if want install; then
   fi
   sudo cp /var/log/install.log.*.gz "$OUT/" 2>/dev/null || true
   sudo chown "$(id -un)" "$OUT"/* 2>/dev/null || true
+fi
+
+# Warn about steps that produced nothing. `|| true` is deliberate — one failed
+# category should not discard the rest of a capture — but a silent zero is how a
+# bad window or a missing sudo ends up looking like "nothing happened". A
+# legitimately empty category exists too (storedownloadd on a Mac that downloaded
+# nothing), so this warns rather than failing.
+EMPTY=""
+for f in "$OUT"/*.ndjson; do
+  [ -e "$f" ] || continue
+  # log show writes a {"count":N,"finished":1} trailer even for zero matches.
+  if [ "$(grep -cv '"finished"' "$f" 2>/dev/null || echo 0)" = "0" ]; then
+    EMPTY="$EMPTY $(basename "$f")"
+  fi
+done
+if [ -n "$EMPTY" ]; then
+  echo "  note: no events captured for:$EMPTY" >&2
+  echo "        expected for an idle category; if ALL are empty, check the window" >&2
+  echo "        ('$WINDOW') and that you ran with sudo." >&2
 fi
 
 # Manifest so we can see what landed without opening the files.

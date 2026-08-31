@@ -17,7 +17,7 @@ left; clean, redacted `Event` / `Timeline` objects leave on the right. The
 ```
                           predicate      source          parse          normalize        correlate        redact
   category + OS  ──►  predicates.resolve ─► sources.fetch ─► parser ──► normalize.normalize ─► engine ──► redact ──► Event / Timeline
-                       (data/*.json)      (log show ndjson)  (ndjson+ts)   (heuristic fields)   (stitch)   (allowlist)   (JSON out)
+                       (data/*.json)      (log show ndjson)  (ndjson+ts)   (heuristic fields)   (stitch)    (denylist)   (JSON out)
 ```
 
 Layers, bottom to top:
@@ -149,10 +149,20 @@ there is **no protocol CommandUUID**. Extraction order:
   The salt is `os.urandom(16)`, fresh per process, never persisted — so the model
   can correlate "same device/command" across events without ever seeing the real
   value, and nothing is reversible after the process exits.
-- **`scrub_message(message)`** — an **allowlist of scrubbers** applied to free
-  text: bearer/auth tokens, ≥32-char hex blobs (push tokens), emails, IPv4,
-  Apple serials (letter+digit heuristic so all-caps words survive), and ≥10-digit
-  runs (IMEIs). Conservative by default — you opt into *less*, never more.
+- **`scrub_message(message)`** — a **denylist of scrubbers** applied to free
+  text: keyed secrets (any key ending in token/key/secret/password/…, so
+  camelCase MDM payload keys like `DeviceToken` and `EscrowKey` are covered),
+  keyed identifiers (`SerialNumber`, `UDID`, `IMEI`, `PushMagic`, … — hashed by
+  KEY rather than by value shape), server URLs (host hashed, path dropped),
+  ≥32-char hex blobs, emails, IPv4/IPv6, MACs, account names, and ≥10-digit runs.
+
+  **This is a denylist, and that matters.** Anything not matched by a pattern
+  passes through. Every gap found so far was found by running real Apple output
+  rather than by reading the regexes — a `\b(token|…)\b` rule that looked
+  correct could not fire on `DeviceToken` at all. When you add a field to any
+  parser, check the value against `scrub_message` before returning it, and
+  verify a rendered report with `tools/redaction-audit.sh` on the machine that
+  produced the capture.
 
 ### `install_log.py` — `/var/log/install.log` → `InstallRecord` (spec §7.4)
 
@@ -269,7 +279,7 @@ src/mdm_log_analyzer/
   parser.py        ndjson parse + timestamp normalization
   sources.py       Live / Archive / Fixture + open_archive_source + probe (§5)
   normalize.py     raw dict -> Event, heuristic MDM field extraction
-  redact.py        per-session salted hashing + scrub allowlist (§4.3)
+  redact.py        per-session salted hashing + scrub denylist (§4.3)
   install_log.py   install.log -> InstallRecord (§7.4)
   ddm_status.py    declarative logs -> declaration status (§7.5)
   device_context.py mdmclient logs -> device context (§7.1)

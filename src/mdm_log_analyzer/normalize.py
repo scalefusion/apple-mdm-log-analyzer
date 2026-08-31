@@ -7,7 +7,6 @@ here so they can be tuned per macOS build alongside the predicate table.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from .parser import to_iso_utc
 from .redact import hash_id, scrub_message

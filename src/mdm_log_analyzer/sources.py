@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 import zipfile
 from abc import ABC, abstractmethod
+from typing import Optional  # used in annotations; see get_type_hints
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
 
@@ -300,7 +301,17 @@ class LiveLogSource(LogSource):
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
         argv = _build_argv(predicate, last, level, archive=None)
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, check=False,
+                timeout=_LOG_SHOW_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"`log show` exceeded {_LOG_SHOW_TIMEOUT}s and was killed. "
+                "Narrow the window (`last`) or the category; a wide window at "
+                "--info --debug on a busy Mac can take minutes."
+            ) from e
         if proc.returncode != 0:
             raise RuntimeError(f"log show failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -340,7 +351,17 @@ class ArchiveLogSource(LogSource):
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
         argv = _build_argv(predicate, last, level, archive=self.archive_path)
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, check=False,
+                timeout=_LOG_SHOW_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"`log show` exceeded {_LOG_SHOW_TIMEOUT}s and was killed. "
+                "Narrow the window (`last`) or the category; a wide window at "
+                "--info --debug on a busy Mac can take minutes."
+            ) from e
         if proc.returncode != 0:
             raise RuntimeError(f"log show --archive failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -393,12 +414,12 @@ class FixtureLogSource(LogSource):
                 "FixtureLogSource has no install_log_path configured"
             )
         return _filter_install_window_anchored(
-            self.install_log_path.read_text(), last
+            self.install_log_path.read_text(errors="replace"), last
         )
 
     def probe(self) -> dict:
         times = []
-        for line in self.fixture_path.read_text().splitlines():
+        for line in self.fixture_path.read_text(errors="replace").splitlines():
             line = line.strip().rstrip(",")
             if not line or line in ("[", "]"):
                 continue
@@ -414,7 +435,7 @@ class FixtureLogSource(LogSource):
         }
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
-        text = _filter_ndjson_window(self.fixture_path.read_text(), last)
+        text = _filter_ndjson_window(self.fixture_path.read_text(errors="replace"), last)
         return _filter_ndjson_text(text, predicate)
 
 
@@ -541,6 +562,30 @@ def _looks_like_bundle(d: Path) -> bool:
 # Extraction cleanup — per-process temp dirs, removed at exit so we stay stateless.
 _EXTRACTED_TEMP_DIRS: list[str] = []
 
+# Ceiling on UNCOMPRESSED bytes written by one extraction. Neither guard below
+# looked at expanded size, so a well-formed 538 KB tarball (valid os.txt, valid
+# NDJSON — nothing a shape check rejects) expanded to 188 MB, and every
+# open_archive call on the same path extracted a fresh copy retained until the
+# process exits. An MCP server lives as long as the client session, so three
+# calls filled 564 MB in half a second. No malice needed either: the engine's own
+# comments cite a real 205 MB bundle, and a model retrying open_archive does
+# exactly this. 1 GiB is generous for a log bundle and still bounded.
+_MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
+
+# `log show` has no timeout, buffers everything in memory, and on a wide window
+# at --info --debug can run for minutes — which presents to a caller as the tool
+# hanging rather than as a slow query (engine.py documents the same symptom).
+# A timeout turns it into an error that says what to do.
+_LOG_SHOW_TIMEOUT = 180
+
+# Extraction results, keyed by resolved source path, so repeat opens reuse the
+# directory instead of duplicating it.
+_EXTRACTED_BY_PATH: dict[str, Path] = {}
+
+
+class ExtractionTooLarge(ValueError):
+    """Raised when an archive expands past _MAX_EXTRACT_BYTES."""
+
 
 def _cleanup_extracted_dirs():
     for d in _EXTRACTED_TEMP_DIRS:
@@ -553,6 +598,9 @@ atexit.register(_cleanup_extracted_dirs)
 def _safe_extract_tarball(tar_path: Path) -> Path:
     """Extract a bundle tarball into a per-process temp dir with path-traversal
     guards, and return the extracted top-level bundle directory."""
+    cached = _EXTRACTED_BY_PATH.get(str(tar_path.resolve()))
+    if cached is not None and cached.exists():
+        return cached
     tmp = tempfile.mkdtemp(prefix="mdm-log-analyzer-bundle-")
     _EXTRACTED_TEMP_DIRS.append(tmp)
     tmp_root = Path(tmp).resolve()
@@ -583,6 +631,13 @@ def _safe_extract_tarball(tar_path: Path) -> Path:
                     raise ValueError(
                         f"unsafe tarball link: {member.name} -> {member.linkname}"
                     )
+        # Refuse before writing anything: the member headers declare the
+        # uncompressed size, so a compression bomb is rejected without touching
+        # the disk.
+        total = 0
+        for member in tf.getmembers():
+            if member.isreg():
+                total = _check_extract_budget(total, member.size, member.name)
         # Belt and braces: tarfile's own 'data' filter rejects absolute links,
         # device nodes and setuid bits too. It arrived in 3.12 and was backported
         # to 3.11.4 (PEP 706), so feature-detect rather than assume — the
@@ -595,7 +650,20 @@ def _safe_extract_tarball(tar_path: Path) -> Path:
             tf.extractall(tmp)
     # Find the bundle root — usually the single top-level directory produced
     # by collect-mdm-logs.sh (mdm-logs-<host>/).
-    return _find_bundle_root(Path(tmp), tar_path.name)
+    root = _find_bundle_root(Path(tmp), tar_path.name)
+    _EXTRACTED_BY_PATH[str(tar_path.resolve())] = root
+    return root
+
+
+def _check_extract_budget(total: int, added: int, name: str) -> int:
+    """Accumulate uncompressed bytes and refuse to blow the budget."""
+    total += max(0, added)
+    if total > _MAX_EXTRACT_BYTES:
+        raise ExtractionTooLarge(
+            f"archive expands past {_MAX_EXTRACT_BYTES // (1024 * 1024)} MiB "
+            f"(at member {name!r}); refusing to extract"
+        )
+    return total
 
 
 def _safe_extract_zip(zip_path: Path) -> Path:
@@ -607,6 +675,9 @@ def _safe_extract_zip(zip_path: Path) -> Path:
     file and users fell back to attaching it to the chat, which skips redaction
     entirely (see README "Attach vs open_archive").
     """
+    cached = _EXTRACTED_BY_PATH.get(str(zip_path.resolve()))
+    if cached is not None and cached.exists():
+        return cached
     tmp = tempfile.mkdtemp(prefix="mdm-log-analyzer-bundle-")
     _EXTRACTED_TEMP_DIRS.append(tmp)
     tmp_root = Path(tmp).resolve()
@@ -620,12 +691,16 @@ def _safe_extract_zip(zip_path: Path) -> Path:
             # Finder stores resource forks in __MACOSX/; they are not bundle content.
             if not n.startswith("__MACOSX/") and not Path(n).name.startswith("._")
         ]
+        total = 0
         for name in members:
             target = (tmp_root / name).resolve()
             if not _within(tmp_root, target):
                 raise ValueError(f"unsafe zip member: {name}")
+            total = _check_extract_budget(total, zf.getinfo(name).file_size, name)
         zf.extractall(tmp, members=members)
-    return _find_bundle_root(Path(tmp), zip_path.name)
+    root = _find_bundle_root(Path(tmp), zip_path.name)
+    _EXTRACTED_BY_PATH[str(zip_path.resolve())] = root
+    return root
 
 
 def _find_bundle_root(tmp: Path, label: str) -> Path:
@@ -643,6 +718,52 @@ def _find_bundle_root(tmp: Path, label: str) -> Path:
         f"{label} does not look like a collect-mdm-logs.sh bundle "
         "(missing os.txt + *.ndjson). Sysdiagnose tarballs aren't yet supported; "
         "extract the .logarchive from the sysdiagnose and open that instead."
+    )
+
+
+# Fields that identify a line as `log show --style ndjson` output. A record does
+# not have to carry all of them, but it must carry a timestamp and at least one
+# process/message field — anything else is not a log export.
+_LOG_SHOW_FIELDS = ("eventMessage", "processImagePath", "process", "subsystem",
+                    "messageType", "traceID")
+
+
+def _require_log_show_shape(path: Path, sample_lines: int = 200) -> None:
+    """Reject a .json/.ndjson that is not a `log show` export.
+
+    Without this, ANY readable file opened as a source: a binary file decoded to
+    mojibake and became a valid, empty archive (`os_build: fixture-os15`, zero
+    events), and an unrelated .json was accepted and its contents returned
+    through query_events. Both present as "the window was clean" rather than as
+    an error, which is the failure mode this project exists to avoid.
+    """
+    checked = 0
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip().rstrip(",")
+                if not line or line in ("[", "]"):
+                    continue
+                checked += 1
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if set(obj) == {"count", "finished"}:
+                    continue  # log show's end-of-export trailer
+                if obj.get("timestamp") and any(f in obj for f in _LOG_SHOW_FIELDS):
+                    return  # one good record is enough
+                if checked >= sample_lines:
+                    break
+    except OSError as e:
+        raise ValueError(f"cannot read {path.name}: {e}") from e
+    raise ValueError(
+        f"{path.name} does not look like `log show --style ndjson` output "
+        "(no record with a timestamp and a process/message field in the first "
+        f"{sample_lines} lines). Export with: "
+        "log show --style ndjson --predicate ... > capture.ndjson"
     )
 
 
@@ -670,6 +791,7 @@ def open_archive_source(path: str | Path, os_major: int | None = None) -> LogSou
     if p.is_dir() and _looks_like_bundle(p):
         return BundleLogSource(p, os_major=os_major)
     if name.endswith((".ndjson", ".json")):
+        _require_log_show_shape(p)
         return FixtureLogSource(p, os_major=os_major or 15)
     if name.endswith(".logarchive"):
         return ArchiveLogSource(str(p), os_major=os_major or _DEFAULT_ARCHIVE_OS)

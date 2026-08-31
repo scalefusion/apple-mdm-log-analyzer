@@ -303,7 +303,12 @@ def test_report_renders_a_pasteable_incident_report():
     # Redaction survives it too — this text gets pasted into a third party.
     assert "C02ABC123DEF" not in md
     assert "admin@example.com" not in md
-    assert "<redacted-serial>" in md
+    # The fixture names the serial by its key (`SerialNumber=…`), so it is
+    # HASHED rather than blanked: two events about one device still correlate,
+    # which a `<redacted-serial>` placeholder cannot do. A serial appearing bare
+    # in prose is still blanked by the value-shape rule — see
+    # test_redaction_covers_every_class_the_docs_promise.
+    assert "h-" in md
 
     # Small enough for any chat box (this fixture is tiny; the caps hold the
     # real ceiling). ~4 chars/token.
@@ -937,7 +942,8 @@ def test_bundle_tarball_rejects_non_bundle_shape():
 def test_bundle_source_tarball_path_traversal_guard():
     # A tarball with a member trying to escape the extraction root must be
     # rejected — no writing outside the temp dir.
-    import tarfile as _tf, io
+    import tarfile as _tf
+    import io
 
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / "evil.tar.gz"
@@ -2678,6 +2684,358 @@ def test_missing_push_is_not_reported_when_push_was_not_captured():
         assert "missing_push" not in codes, codes
         # The real failure is still reported.
         assert "command_failures" in codes, codes
+
+
+
+def test_camelcase_mdm_secret_keys_are_redacted():
+    # `\b(token|…)\b` can never fire on a camelCase key: there is no word
+    # boundary inside `DeviceToken`. So the highest-value secrets in the MDM
+    # protocol all passed through untouched. Each string below was verified
+    # leaking before the fix.
+    from mdm_log_analyzer.redact import scrub_message
+
+    leaked = {
+        "APNs push token": "DeviceToken = <8a2f9c1d 4b7e0a33 91ffee02 3b7c8d19>;",
+        "unlock token": 'UnlockToken = "TXlTZWNyZXRVbmxvY2tUb2tlbg==";',
+        "escrow key": "EscrowKey = ABCDEFGHIJKLMNOP;",
+        "await-configured token": "AwaitDeviceConfiguredToken=hunter2secret",
+        "bootstrap token": "BootstrapToken = <deadbeef cafebabe>;",
+    }
+    for label, line in leaked.items():
+        out = scrub_message(line)
+        assert "<redacted>" in out, f"{label} not redacted: {out!r}"
+        for secret in ("8a2f9c1d", "TXlTZWNyZXRVbmxvY2tUb2tlbg", "ABCDEFGHIJKLMNOP",
+                       "hunter2secret", "deadbeef"):
+            assert secret not in out, f"{label} leaked {secret}: {out!r}"
+
+    # The value is consumed to a STRUCTURAL terminator, not to whitespace.
+    # `\S+` stopped at the first space, so a quoted value leaked its tail and a
+    # space-grouped push token leaked every group after the first.
+    out = scrub_message('password = "hunter 2 with spaces";')
+    assert "hunter" not in out and "spaces" not in out, out
+
+    # Still handles the scheme-word form it always did.
+    assert "abc.def.ghi" not in scrub_message("Authorization: Bearer abc.def.ghi")
+
+
+def test_secret_rule_does_not_eat_diagnostic_prose():
+    # The word "key" appears in ordinary log text — "Invalid value type for
+    # configuration key: Calculator.BasicMode.AddSquareRoot" is the entire
+    # diagnosis of an invalid DDM declaration. Treating a bare prose "key" as a
+    # secret key redacted the answer the tool exists to produce.
+    from mdm_log_analyzer.redact import scrub_message
+
+    ddm = ("Invalid value type for configuration key: "
+           "Calculator.BasicMode.AddSquareRoot, setting key "
+           "calculator.forceSquareRootOnBasicCalculator")
+    assert scrub_message(ddm) == ddm
+
+    # macOS's own masking marker must survive — triage keys the
+    # private_data_masked finding off it. The guard must also survive
+    # backtracking: `\s*[=:]\s*(?!<private>)` can give back its space and check
+    # the wrong position.
+    assert "<private>" in scrub_message("challenge: <private>")
+    assert "<private>" in scrub_message("challenge:<private>")
+    assert "<private>" in scrub_message("Keys: <private>")
+
+    # Keychain prose is diagnostic and starts with "Key".
+    kc = "Keychain: Getting identity with ref: <IdentCert: foo>"
+    assert scrub_message(kc) == kc
+
+
+def test_keyed_identifiers_are_redacted_by_key_not_by_value_shape():
+    # normalize.py already recognised `SerialNumber = …` as a serial by its KEY,
+    # hashed it into device_ref, and left the plaintext in message. The
+    # value-shape heuristic is a backstop: it requires both a letter and a digit
+    # (so all-caps words like DEVICELOCKED survive), which drops an all-alpha
+    # serial, and it never matched a hyphenated IMEI.
+    from mdm_log_analyzer.redact import scrub_message
+
+    for line, secret in [
+        ("SerialNumber = FVFXQLMNPQRS;", "FVFXQLMNPQRS"),      # all-alpha serial
+        ("IMEI = 35-209900-176148-1", "35-209900-176148-1"),   # hyphenated
+        ("UDID = ABCDEFGHIJKLMNOPQRST;", "ABCDEFGHIJKLMNOPQRST"),
+        ("PushMagic = QWERTYUIOP;", "QWERTYUIOP"),
+        ("EthernetMAC = notamacaddress;", "notamacaddress"),
+    ]:
+        out = scrub_message(line)
+        assert secret not in out, f"leaked: {out!r}"
+        # Hashed, not blanked, so two events about one device still correlate.
+        assert "h-" in out, out
+
+    # The same value hashes the same way, so correlation survives.
+    a = scrub_message("SerialNumber = FVFXQLMNPQRS;")
+    b = scrub_message("Serial: FVFXQLMNPQRS")
+    assert a.split("h-")[1].rstrip(";") == b.split("h-")[1]
+
+
+def test_mdm_server_url_is_not_returned_in_cleartext():
+    # get_device_context hashes the MDM host into mdm_server_host because it IS
+    # an identifier — it names the tenant — but with no rule here the same host
+    # came back raw from every other tool, which made the hashing cosmetic.
+    from mdm_log_analyzer.redact import hash_id, scrub_message
+
+    out = scrub_message("Calling MDM_Connect for: https://mdm.example-tenant.com/apple/mdm")
+    assert "mdm.example-tenant.com" not in out, out
+    assert "h-" in out
+
+    # The host hashes to the same digest as get_device_context's `h:` form, so a
+    # reader can still tie a message to the reported server.
+    field = hash_id("mdm.example-tenant.com")
+    assert field.split("h:")[1] in out, (field, out)
+
+    # The PATH is dropped, not hashed: a real capture carried a SCEP challenge
+    # inside it.
+    scep = scrub_message(
+        "Processing MDM_SCEP_Enroll for server: https://api.example.com/apple/scep/TUNMUkQ3UGd"
+    )
+    assert "TUNMUkQ3UGd" not in scep, scep
+    assert "<redacted-path>" in scep
+
+
+
+def test_query_events_response_fits_the_transport():
+    # query_events capped the event COUNT but never the byte size — the one
+    # response path with no byte discipline, while _MAX_PHASES,
+    # _MAX_TIMELINE_EVENTS and MAX_EVIDENCE all exist because of the 1 MB MCP
+    # limit. At the 5000-event ceiling with realistic ~3 KB payload-dump lines
+    # the response measured 15.4 MB, which the transport refuses outright.
+    import json as _json
+
+    big = "PayloadContent = ( { Data = " + "Q" * 2900 + "; } );"
+    lines = [
+        _json.dumps(
+            {
+                # Microseconds, so timestamps are strictly monotonic — with
+                # `i % 60` for the minute they are not, and "the newest event
+                # survives" cannot be asserted.
+                "timestamp": f"2026-08-24 10:00:00.{i:06d}+0530",
+                "processImagePath": "/usr/libexec/mdmclient",
+                "subsystem": "com.apple.ManagedClient",
+                "messageType": "Default",
+                "eventMessage": big,
+                "traceID": f"t{i}",
+                "machTimestamp": i,
+            }
+        )
+        for i in range(5200)
+    ]
+    src = FixtureLogSource(_write_fixture(lines), os_major=26)
+    res = engine.query_events(src, "mdm_command", last="1h", limit=5000)
+
+    assert len(_json.dumps(res)) < 1_000_000, len(_json.dumps(res))
+    # The true total is still reported — the cap must never hide the scale.
+    assert res["count"] == 5200
+    t = res["truncation"]
+    assert t["keeps"] == "most_recent"
+    assert t["messages_clipped"] > 0
+    assert t["dropped_for_size"] > 0
+    assert t["kept"] == len(res["events"])
+    # Recency is what matters for an incident: the newest event survives.
+    assert res["events"][-1]["raw_ref"].startswith("t5199")
+
+
+def test_archive_extraction_is_bounded_and_reused():
+    # Neither extraction guard looked at UNCOMPRESSED size, and each open_archive
+    # on the same path extracted a fresh copy retained until process exit. A
+    # well-formed 538 KB tarball expanded to 188 MB, and three calls held 564 MB.
+    # An MCP server lives as long as the client session.
+    import io as _io
+    import json as _json
+    import tarfile as _tarfile
+
+    from mdm_log_analyzer import sources as _sources
+
+    # The budget refuses before writing anything, so it is unit-tested on the
+    # accumulator rather than by generating a multi-gigabyte fixture.
+    total = 0
+    refused = False
+    try:
+        for i in range(20):
+            total = _sources._check_extract_budget(total, 200 * 1024 * 1024, f"m{i}")
+    except _sources.ExtractionTooLarge:
+        refused = True
+    assert refused, "budget never fired"
+    assert total <= _sources._MAX_EXTRACT_BYTES
+
+    # Repeat opens of one path reuse the extraction.
+    with tempfile.TemporaryDirectory() as td:
+        tar = Path(td) / "bundle.tar.gz"
+        line = _json.dumps(
+            {
+                "timestamp": "2026-08-24 10:00:00.000000+0530",
+                "processImagePath": "/usr/libexec/mdmclient",
+                "eventMessage": "hello",
+                "traceID": "t1",
+                "machTimestamp": 1,
+            }
+        ).encode()
+        with _tarfile.open(tar, "w:gz") as tf:
+            for name, data in (
+                ("os.txt", b"ProductName:\tmacOS\nProductVersion:\t26.0\n"),
+                ("mdmclient.ndjson", line),
+            ):
+                ti = _tarfile.TarInfo("mdm-logs-x/" + name)
+                ti.size = len(data)
+                tf.addfile(ti, _io.BytesIO(data))
+
+        before = len(_sources._EXTRACTED_TEMP_DIRS)
+        a = _sources.open_archive_source(str(tar))
+        b = _sources.open_archive_source(str(tar))
+        c = _sources.open_archive_source(str(tar))
+        assert len(_sources._EXTRACTED_TEMP_DIRS) - before == 1, "re-extracted"
+        assert a.bundle_dir == b.bundle_dir == c.bundle_dir
+
+
+
+def test_tools_return_the_error_contract_not_a_traceback():
+    # Every tool documents {"error": …} on failure, but the engine call sat
+    # OUTSIDE the try in five of six tools, and probe() sat outside it in
+    # open_archive — so a non-UTF-8 file raised UnicodeDecodeError straight out
+    # of the tool, and a failed or timed-out `log show` (RuntimeError) or
+    # /var/log/install.log without root (PermissionError) escaped as well.
+    # This suite is deliberately stdlib-only, and server.py imports the mcp
+    # SDK. Assert the guard statically either way, and exercise it live only
+    # when the SDK happens to be installed. test_server_smoke.py covers the
+    # live path properly.
+    src = (ROOT / "src" / "mdm_log_analyzer" / "server.py").read_text()
+    assert "_TOOL_ERRORS" in src and "def _guard(" in src
+    for exc in ("RuntimeError", "PermissionError", "UnicodeDecodeError",
+                "predicates.PredicateError"):
+        assert exc in src.split("_TOOL_ERRORS = (")[1].split(")")[0], exc
+    # probe() must be inside the guard, not after it.
+    open_archive_body = src.split("def open_archive(")[1].split("@mcp.tool()")[0]
+    guarded = open_archive_body.split("try:")[1].split("except")[0]
+    assert "src.probe()" in guarded, "probe() is outside the try again"
+
+    try:
+        from mdm_log_analyzer import server
+    except ModuleNotFoundError:
+        return  # mcp SDK absent; static assertions above still ran
+
+    def call(tool, *a, **kw):
+        return getattr(tool, "fn", tool)(*a, **kw)
+
+    with tempfile.TemporaryDirectory() as td:
+        binary = Path(td) / "notutf8.json"
+        binary.write_bytes(b"\xff\xfe\x00\x80 not utf-8 at all")
+        out = call(server.open_archive, str(binary))
+        assert "error" in out, out
+        assert "traceback" not in str(out).lower()
+
+        missing = call(server.open_archive, str(Path(td) / "nope.tar.gz"))
+        assert "error" in missing, missing
+
+    # The shared tuple is what every tool now guards on, so RuntimeError from a
+    # failed `log show` and PermissionError from install.log are both covered.
+    assert RuntimeError in server._TOOL_ERRORS
+    assert PermissionError in server._TOOL_ERRORS
+    assert UnicodeDecodeError in server._TOOL_ERRORS
+
+
+def test_version_is_derived_not_hardcoded():
+    # __init__.py hardcoded 0.1.0 while pyproject said 1.0.0, so
+    # mdm_log_analyzer.__version__ lied while the MCP handshake (which already
+    # read metadata) was right.
+    import mdm_log_analyzer
+
+    src = (ROOT / "src" / "mdm_log_analyzer" / "__init__.py").read_text()
+    assert "importlib.metadata" in src, "version must come from metadata"
+    assert '__version__ = "0.' not in src and '__version__ = "1.' not in src, (
+        "version is hardcoded again"
+    )
+    assert mdm_log_analyzer.__version__
+
+
+def test_annotations_resolve():
+    # `Optional` was used in sources.py but never imported. `from __future__
+    # import annotations` defers evaluation, so nothing failed until something
+    # called get_type_hints — exactly the class a type checker catches.
+    from typing import get_type_hints
+
+    from mdm_log_analyzer import ddm_status, device_context, engine, install_log
+    from mdm_log_analyzer import normalize, redact, sources, triage
+
+    for mod in (sources, engine, normalize, redact, triage, install_log,
+                ddm_status, device_context):
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if callable(obj) and getattr(obj, "__module__", None) == mod.__name__:
+                try:
+                    get_type_hints(obj)
+                except NameError as e:  # an unimported annotation
+                    raise AssertionError(f"{mod.__name__}.{name}: {e}") from e
+                except Exception:
+                    pass  # not all callables are introspectable; only NameError matters
+
+
+def test_collector_validates_its_window_and_protects_the_bundle():
+    # An unvalidated window produced an empty-but-well-formed bundle that passes
+    # the analyzer's shape check, because every capture step ends in `|| true`.
+    # And the bundle is UNREDACTED, so a default umask left it world-readable —
+    # contradicting the script's own PRIVACY header.
+    script = (ROOT / "tools" / "collect-mdm-logs.sh").read_text()
+
+    assert "umask 077" in script, "unredacted bundle must not be world-readable"
+    assert "^[0-9]+[smhd]$" in script, "window is not validated"
+    # A bad window must exit, not fall through to a capture.
+    assert "Invalid time window" in script
+    # And an all-empty capture must say so rather than looking like "nothing
+    # happened".
+    assert "no events captured for" in script
+
+
+
+def test_a_json_source_must_look_like_a_log_export():
+    # ANY readable .json/.ndjson was accepted as a source. A review demonstrated
+    # an unrelated .json being opened and its contents returned verbatim through
+    # query_events. Worse than the leak: a binary file decoded to mojibake and
+    # became a valid, EMPTY archive — presenting as "the window was clean"
+    # rather than as an error, which is the exact failure mode this project
+    # exists to avoid.
+    import json as _json
+
+    from mdm_log_analyzer import sources as _sources
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+
+        binary = d / "binary.json"
+        binary.write_bytes(b"\xff\xfe\x00\x80 not utf-8 at all")
+        try:
+            _sources.open_archive_source(str(binary))
+            assert False, "binary file accepted as a log source"
+        except ValueError as e:
+            assert "log show" in str(e), e
+
+        decoy = d / "notes.json"
+        decoy.write_text(_json.dumps({"note": "internal", "password": "hunter2"}))
+        try:
+            _sources.open_archive_source(str(decoy))
+            assert False, "unrelated .json accepted as a log source"
+        except ValueError as e:
+            assert "log show" in str(e), e
+
+        # A real export is still accepted, trailer and blank lines included.
+        good = d / "good.ndjson"
+        good.write_text(
+            "\n".join(
+                [
+                    "",
+                    _json.dumps({"count": 0, "finished": 1}),  # log show trailer
+                    _json.dumps(
+                        {
+                            "timestamp": "2026-08-24 10:00:00.000000+0530",
+                            "process": "mdmclient",
+                            "eventMessage": "hello",
+                            "traceID": "t1",
+                        }
+                    ),
+                ]
+            )
+        )
+        src = _sources.open_archive_source(str(good))
+        assert engine.query_events(src, "mdm_command", last="1d")["count"] == 1
 
 
 if __name__ == "__main__":

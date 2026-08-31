@@ -78,8 +78,9 @@ Three properties, in the code rather than the docs:
   the data is your client's choice, never something this server decides.
 - **Redaction is mandatory and on by default.** Serials, UDIDs, usernames,
   IP/MAC addresses, tokens and certificate material are hashed with a
-  per-session salt or scrubbed, on an allowlist basis, before anything is
-  returned. Verify it against your own machine with
+  per-session salt or scrubbed before anything is returned. Note the mechanism
+  honestly: it is a **denylist** of patterns for known identifier and secret
+  shapes, so an unanticipated field can pass through. Verify it against your own machine with
   [`tools/redaction-audit.sh`](./tools/redaction-audit.sh).
 - **No tool returns raw log text.** Tools return structured events, never lines.
 
@@ -88,7 +89,7 @@ redacts on read, not on capture. See SETUP.md §8b.
 
 ## Status
 
-Seven tools, 94 engine tests (stdlib-only) plus a stdio smoke test of the server
+Seven tools, 105 engine tests (stdlib-only) plus a stdio smoke test of the server
 itself. Per-OS predicate files for **macOS 11 / 14 / 15 / 26 / 27**.
 
 Known limits, so you do not rediscover them:
@@ -138,4 +139,4 @@ as `<private>`, and DDM failure detail is not logged at all. See SETUP.md §5.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). © 2026 Scalefusion.
+MIT — see [LICENSE](./LICENSE). © 2026 Scalefusion Inc.
