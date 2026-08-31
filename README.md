@@ -139,4 +139,4 @@ as `<private>`, and DDM failure detail is not logged at all. See SETUP.md §5.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). © 2026 Scalefusion.
+MIT — see [LICENSE](./LICENSE). © 2026 Scalefusion Inc.
