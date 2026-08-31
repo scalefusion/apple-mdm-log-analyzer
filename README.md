@@ -41,6 +41,20 @@ mcp-mdm-log-analyzer --report --symptom install_failure --last 1d \
   --source tests/fixtures/mdm_sample.ndjson
 ```
 
+## AI disclosure
+
+This codebase was written with [Claude Code](https://github.com/anthropics/claude-code)
+(Anthropic). Direction, test scenarios and validation came from a human
+maintainer: almost every behaviour here was corrected after being run against
+real macOS 26/27 captures and found wrong, and each correction has a regression
+test naming the capture that exposed it.
+
+What has not happened: no independent security review, and no formal audit of
+the redaction layer. Redaction is mandatory and tested, and
+[`tools/redaction-audit.sh`](./tools/redaction-audit.sh) checks a rendered report
+against a machine's real identifiers — **run it on your own data before trusting
+the privacy posture for anything sensitive.**
+
 ## Quickstart
 
 ```bash
