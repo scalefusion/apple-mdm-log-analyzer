@@ -1,6 +1,6 @@
 [project]
 name = "mdm-log-analyzer"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local, stateless MCP server that extracts, parses, and correlates macOS MDM/DDM/installer log events into structured, redacted timelines."
 readme = "README.md"
 requires-python = ">=3.11"

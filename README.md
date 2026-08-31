@@ -89,7 +89,7 @@ redacts on read, not on capture. See SETUP.md §8b.
 
 ## Status
 
-Seven tools, 94 engine tests (stdlib-only) plus a stdio smoke test of the server
+Seven tools, 105 engine tests (stdlib-only) plus a stdio smoke test of the server
 itself. Per-OS predicate files for **macOS 11 / 14 / 15 / 26 / 27**.
 
 Known limits, so you do not rediscover them:
