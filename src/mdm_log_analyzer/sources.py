@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 import zipfile
 from abc import ABC, abstractmethod
+from typing import Optional  # used in annotations; see get_type_hints
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
 
@@ -300,7 +301,17 @@ class LiveLogSource(LogSource):
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
         argv = _build_argv(predicate, last, level, archive=None)
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, check=False,
+                timeout=_LOG_SHOW_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"`log show` exceeded {_LOG_SHOW_TIMEOUT}s and was killed. "
+                "Narrow the window (`last`) or the category; a wide window at "
+                "--info --debug on a busy Mac can take minutes."
+            ) from e
         if proc.returncode != 0:
             raise RuntimeError(f"log show failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -340,7 +351,17 @@ class ArchiveLogSource(LogSource):
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
         argv = _build_argv(predicate, last, level, archive=self.archive_path)
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, check=False,
+                timeout=_LOG_SHOW_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"`log show` exceeded {_LOG_SHOW_TIMEOUT}s and was killed. "
+                "Narrow the window (`last`) or the category; a wide window at "
+                "--info --debug on a busy Mac can take minutes."
+            ) from e
         if proc.returncode != 0:
             raise RuntimeError(f"log show --archive failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -393,12 +414,12 @@ class FixtureLogSource(LogSource):
                 "FixtureLogSource has no install_log_path configured"
             )
         return _filter_install_window_anchored(
-            self.install_log_path.read_text(), last
+            self.install_log_path.read_text(errors="replace"), last
         )
 
     def probe(self) -> dict:
         times = []
-        for line in self.fixture_path.read_text().splitlines():
+        for line in self.fixture_path.read_text(errors="replace").splitlines():
             line = line.strip().rstrip(",")
             if not line or line in ("[", "]"):
                 continue
@@ -414,7 +435,7 @@ class FixtureLogSource(LogSource):
         }
 
     def fetch(self, predicate: str, last: str, level: str) -> str:
-        text = _filter_ndjson_window(self.fixture_path.read_text(), last)
+        text = _filter_ndjson_window(self.fixture_path.read_text(errors="replace"), last)
         return _filter_ndjson_text(text, predicate)
 
 
@@ -550,6 +571,12 @@ _EXTRACTED_TEMP_DIRS: list[str] = []
 # comments cite a real 205 MB bundle, and a model retrying open_archive does
 # exactly this. 1 GiB is generous for a log bundle and still bounded.
 _MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
+
+# `log show` has no timeout, buffers everything in memory, and on a wide window
+# at --info --debug can run for minutes — which presents to a caller as the tool
+# hanging rather than as a slow query (engine.py documents the same symptom).
+# A timeout turns it into an error that says what to do.
+_LOG_SHOW_TIMEOUT = 180
 
 # Extraction results, keyed by resolved source path, so repeat opens reuse the
 # directory instead of duplicating it.
@@ -694,6 +721,52 @@ def _find_bundle_root(tmp: Path, label: str) -> Path:
     )
 
 
+# Fields that identify a line as `log show --style ndjson` output. A record does
+# not have to carry all of them, but it must carry a timestamp and at least one
+# process/message field — anything else is not a log export.
+_LOG_SHOW_FIELDS = ("eventMessage", "processImagePath", "process", "subsystem",
+                    "messageType", "traceID")
+
+
+def _require_log_show_shape(path: Path, sample_lines: int = 200) -> None:
+    """Reject a .json/.ndjson that is not a `log show` export.
+
+    Without this, ANY readable file opened as a source: a binary file decoded to
+    mojibake and became a valid, empty archive (`os_build: fixture-os15`, zero
+    events), and an unrelated .json was accepted and its contents returned
+    through query_events. Both present as "the window was clean" rather than as
+    an error, which is the failure mode this project exists to avoid.
+    """
+    checked = 0
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip().rstrip(",")
+                if not line or line in ("[", "]"):
+                    continue
+                checked += 1
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if set(obj) == {"count", "finished"}:
+                    continue  # log show's end-of-export trailer
+                if obj.get("timestamp") and any(f in obj for f in _LOG_SHOW_FIELDS):
+                    return  # one good record is enough
+                if checked >= sample_lines:
+                    break
+    except OSError as e:
+        raise ValueError(f"cannot read {path.name}: {e}") from e
+    raise ValueError(
+        f"{path.name} does not look like `log show --style ndjson` output "
+        "(no record with a timestamp and a process/message field in the first "
+        f"{sample_lines} lines). Export with: "
+        "log show --style ndjson --predicate ... > capture.ndjson"
+    )
+
+
 def open_archive_source(path: str | Path, os_major: int | None = None) -> LogSource:
     """Build a LogSource for a collected archive path (spec §7.6 open_archive).
 
@@ -718,6 +791,7 @@ def open_archive_source(path: str | Path, os_major: int | None = None) -> LogSou
     if p.is_dir() and _looks_like_bundle(p):
         return BundleLogSource(p, os_major=os_major)
     if name.endswith((".ndjson", ".json")):
+        _require_log_show_shape(p)
         return FixtureLogSource(p, os_major=os_major or 15)
     if name.endswith(".logarchive"):
         return ArchiveLogSource(str(p), os_major=os_major or _DEFAULT_ARCHIVE_OS)

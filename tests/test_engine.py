@@ -2886,6 +2886,157 @@ def test_archive_extraction_is_bounded_and_reused():
         assert a.bundle_dir == b.bundle_dir == c.bundle_dir
 
 
+
+def test_tools_return_the_error_contract_not_a_traceback():
+    # Every tool documents {"error": …} on failure, but the engine call sat
+    # OUTSIDE the try in five of six tools, and probe() sat outside it in
+    # open_archive — so a non-UTF-8 file raised UnicodeDecodeError straight out
+    # of the tool, and a failed or timed-out `log show` (RuntimeError) or
+    # /var/log/install.log without root (PermissionError) escaped as well.
+    # This suite is deliberately stdlib-only, and server.py imports the mcp
+    # SDK. Assert the guard statically either way, and exercise it live only
+    # when the SDK happens to be installed. test_server_smoke.py covers the
+    # live path properly.
+    src = (ROOT / "src" / "mdm_log_analyzer" / "server.py").read_text()
+    assert "_TOOL_ERRORS" in src and "def _guard(" in src
+    for exc in ("RuntimeError", "PermissionError", "UnicodeDecodeError",
+                "predicates.PredicateError"):
+        assert exc in src.split("_TOOL_ERRORS = (")[1].split(")")[0], exc
+    # probe() must be inside the guard, not after it.
+    open_archive_body = src.split("def open_archive(")[1].split("@mcp.tool()")[0]
+    guarded = open_archive_body.split("try:")[1].split("except")[0]
+    assert "src.probe()" in guarded, "probe() is outside the try again"
+
+    try:
+        from mdm_log_analyzer import server
+    except ModuleNotFoundError:
+        return  # mcp SDK absent; static assertions above still ran
+
+    def call(tool, *a, **kw):
+        return getattr(tool, "fn", tool)(*a, **kw)
+
+    with tempfile.TemporaryDirectory() as td:
+        binary = Path(td) / "notutf8.json"
+        binary.write_bytes(b"\xff\xfe\x00\x80 not utf-8 at all")
+        out = call(server.open_archive, str(binary))
+        assert "error" in out, out
+        assert "traceback" not in str(out).lower()
+
+        missing = call(server.open_archive, str(Path(td) / "nope.tar.gz"))
+        assert "error" in missing, missing
+
+    # The shared tuple is what every tool now guards on, so RuntimeError from a
+    # failed `log show` and PermissionError from install.log are both covered.
+    assert RuntimeError in server._TOOL_ERRORS
+    assert PermissionError in server._TOOL_ERRORS
+    assert UnicodeDecodeError in server._TOOL_ERRORS
+
+
+def test_version_is_derived_not_hardcoded():
+    # __init__.py hardcoded 0.1.0 while pyproject said 1.0.0, so
+    # mdm_log_analyzer.__version__ lied while the MCP handshake (which already
+    # read metadata) was right.
+    import mdm_log_analyzer
+
+    src = (ROOT / "src" / "mdm_log_analyzer" / "__init__.py").read_text()
+    assert "importlib.metadata" in src, "version must come from metadata"
+    assert '__version__ = "0.' not in src and '__version__ = "1.' not in src, (
+        "version is hardcoded again"
+    )
+    assert mdm_log_analyzer.__version__
+
+
+def test_annotations_resolve():
+    # `Optional` was used in sources.py but never imported. `from __future__
+    # import annotations` defers evaluation, so nothing failed until something
+    # called get_type_hints — exactly the class a type checker catches.
+    from typing import get_type_hints
+
+    from mdm_log_analyzer import ddm_status, device_context, engine, install_log
+    from mdm_log_analyzer import normalize, redact, sources, triage
+
+    for mod in (sources, engine, normalize, redact, triage, install_log,
+                ddm_status, device_context):
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if callable(obj) and getattr(obj, "__module__", None) == mod.__name__:
+                try:
+                    get_type_hints(obj)
+                except NameError as e:  # an unimported annotation
+                    raise AssertionError(f"{mod.__name__}.{name}: {e}") from e
+                except Exception:
+                    pass  # not all callables are introspectable; only NameError matters
+
+
+def test_collector_validates_its_window_and_protects_the_bundle():
+    # An unvalidated window produced an empty-but-well-formed bundle that passes
+    # the analyzer's shape check, because every capture step ends in `|| true`.
+    # And the bundle is UNREDACTED, so a default umask left it world-readable —
+    # contradicting the script's own PRIVACY header.
+    script = (ROOT / "tools" / "collect-mdm-logs.sh").read_text()
+
+    assert "umask 077" in script, "unredacted bundle must not be world-readable"
+    assert "^[0-9]+[smhd]$" in script, "window is not validated"
+    # A bad window must exit, not fall through to a capture.
+    assert "Invalid time window" in script
+    # And an all-empty capture must say so rather than looking like "nothing
+    # happened".
+    assert "no events captured for" in script
+
+
+
+def test_a_json_source_must_look_like_a_log_export():
+    # ANY readable .json/.ndjson was accepted as a source. A review demonstrated
+    # an unrelated .json being opened and its contents returned verbatim through
+    # query_events. Worse than the leak: a binary file decoded to mojibake and
+    # became a valid, EMPTY archive — presenting as "the window was clean"
+    # rather than as an error, which is the exact failure mode this project
+    # exists to avoid.
+    import json as _json
+
+    from mdm_log_analyzer import sources as _sources
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+
+        binary = d / "binary.json"
+        binary.write_bytes(b"\xff\xfe\x00\x80 not utf-8 at all")
+        try:
+            _sources.open_archive_source(str(binary))
+            assert False, "binary file accepted as a log source"
+        except ValueError as e:
+            assert "log show" in str(e), e
+
+        decoy = d / "notes.json"
+        decoy.write_text(_json.dumps({"note": "internal", "password": "hunter2"}))
+        try:
+            _sources.open_archive_source(str(decoy))
+            assert False, "unrelated .json accepted as a log source"
+        except ValueError as e:
+            assert "log show" in str(e), e
+
+        # A real export is still accepted, trailer and blank lines included.
+        good = d / "good.ndjson"
+        good.write_text(
+            "\n".join(
+                [
+                    "",
+                    _json.dumps({"count": 0, "finished": 1}),  # log show trailer
+                    _json.dumps(
+                        {
+                            "timestamp": "2026-08-24 10:00:00.000000+0530",
+                            "process": "mdmclient",
+                            "eventMessage": "hello",
+                            "traceID": "t1",
+                        }
+                    ),
+                ]
+            )
+        )
+        src = _sources.open_archive_source(str(good))
+        assert engine.query_events(src, "mdm_command", last="1d")["count"] == 1
+
+
 if __name__ == "__main__":
     import traceback
 

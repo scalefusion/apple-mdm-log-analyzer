@@ -21,7 +21,7 @@ from typing import Optional
 
 from mcp.server.mcpserver import MCPServer
 
-from . import engine, sources
+from . import engine, predicates, sources
 from .predicates import CATEGORIES
 
 
@@ -49,6 +49,30 @@ _ARCHIVES: dict[str, "sources.LogSource"] = {}
 MAX_EVENT_LIMIT = 5000
 
 
+# Exceptions a tool converts into the {"error": …} contract. RuntimeError covers
+# a failed or timed-out `log show`; PermissionError covers /var/log/install.log
+# without root; UnicodeDecodeError covers a caller pointing at a binary file.
+# Anything not listed is a genuine bug and should surface as one.
+_TOOL_ERRORS = (
+    FileNotFoundError,
+    IsADirectoryError,
+    NotImplementedError,
+    PermissionError,
+    RuntimeError,
+    UnicodeDecodeError,
+    ValueError,
+    predicates.PredicateError,
+)
+
+
+def _guard(fn, *args, **kwargs) -> dict:
+    """Run an engine call, mapping known failures to a structured error."""
+    try:
+        return fn(*args, **kwargs)
+    except _TOOL_ERRORS as e:
+        return {"error": str(e)}
+
+
 def _build_source(source: Optional[str] = None):
     """Select the source: a registered archive_id if given, else the
     environment (archive > fixture > live). Env selection lives in sources.py
@@ -73,11 +97,17 @@ def open_archive(path: str, os_major: Optional[int] = None) -> dict:
     argument to the other tools. Sysdiagnose tarballs aren't supported yet —
     extract the .logarchive and pass that.
     """
+    # probe() must be inside the guard: it READS the file, so a non-UTF-8
+    # .json raised UnicodeDecodeError straight out of the tool and broke the
+    # {"error": …} contract every other failure path honours.
     try:
         src = sources.open_archive_source(path, os_major=os_major)
-    except (FileNotFoundError, ValueError, NotImplementedError) as e:
+        info = src.probe()
+    except (
+        FileNotFoundError, ValueError, NotImplementedError,
+        UnicodeDecodeError, PermissionError, OSError,
+    ) as e:
         return {"error": str(e)}
-    info = src.probe()
     archive_id = "arch:" + hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:10]
     _ARCHIVES[archive_id] = src
     return {"archive_id": archive_id, "os_build": info["os_build"], "time_span": info["time_span"]}
@@ -113,7 +143,7 @@ def query_events(
     # rather than trusted to the caller. `count`/`truncated` still report the
     # true totals, so the model can tell it is seeing a subset.
     limit = max(1, min(limit, MAX_EVENT_LIMIT))
-    return engine.query_events(src, category, last=last, level=level, limit=limit)
+    return _guard(engine.query_events, src, category, last=last, level=level, limit=limit)
 
 
 @mcp.tool()
@@ -140,7 +170,7 @@ def correlate_command(
             time_anchor=time_anchor,
             last=last,
         )
-    except ValueError as e:
+    except _TOOL_ERRORS as e:
         return {"error": str(e)}
 
 
@@ -166,7 +196,7 @@ def get_install_log(
     """
     try:
         return engine.get_install_log(_build_source(source), package_name=package_name, last=last)
-    except (NotImplementedError, ValueError) as e:
+    except _TOOL_ERRORS as e:
         return {"error": str(e)}
 
 
@@ -198,7 +228,7 @@ def build_incident_bundle(
         src = _build_source(source)
     except ValueError as e:
         return {"error": str(e)}
-    return engine.build_incident_bundle(src, symptom=symptom, last=last)
+    return _guard(engine.build_incident_bundle, src, symptom=symptom, last=last)
 
 
 @mcp.tool()
@@ -220,7 +250,7 @@ def get_device_context(last: str = "1d", source: Optional[str] = None) -> dict:
         src = _build_source(source)
     except ValueError as e:
         return {"error": str(e)}
-    return engine.get_device_context(src, last=last)
+    return _guard(engine.get_device_context, src, last=last)
 
 
 @mcp.tool()
@@ -245,7 +275,7 @@ def get_ddm_status(
         src = _build_source(source)
     except ValueError as e:
         return {"error": str(e)}
-    return engine.get_ddm_status(src, declaration_id=declaration_id, last=last)
+    return _guard(engine.get_ddm_status, src, declaration_id=declaration_id, last=last)
 
 
 def main() -> None:
