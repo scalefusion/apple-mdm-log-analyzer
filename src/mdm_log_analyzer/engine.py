@@ -17,6 +17,14 @@ from .triage import triage_app_installs, triage_timeline
 _CORRELATION_CATEGORIES = ("mdm_command", "ddm", "push", "asset_download", "scheduling")
 _CONTEXT_PAD_MS = 60_000  # include push/download context within 60s of the match
 _MAX_PHASES = 500  # cap install.log per-line records in a response (see get_install_log)
+# query_events capped the event COUNT but never the byte size, and it is the one
+# response path with no byte discipline — every other list here is capped
+# because of the 1 MB MCP limit. At the 5000-event ceiling with realistic ~3 KB
+# payload-dump lines that is a 15 MB response the transport refuses outright.
+# Two independent limits: clip an individual message, then drop events (oldest
+# first, keeping the most recent) until the whole response fits.
+_MAX_EVENT_MESSAGE = 2000
+_MAX_RESPONSE_BYTES = 900_000
 
 
 def _collect(
@@ -68,6 +76,7 @@ def query_events(
     # ~50 minutes, including every command result, was silently dropped while
     # `count` still reported the full total.
     kept = events[-limit:] if truncated else events
+    dicts, clipped, dropped = _fit_events(kept)
     out = {
         "category": category,
         # Which source actually answered. A caller that omits `source` silently
@@ -80,15 +89,55 @@ def query_events(
         "predicate_version": spec["predicate_version"],
         "exact_version_match": spec["exact_version_match"],
         "note": spec.get("note"),
-        "events": [e.to_dict() for e in kept],
+        "events": dicts,
     }
-    if truncated:
+    if truncated or dropped:
         out["truncation"] = {
-            "kept": len(kept),
+            "kept": len(dicts),
             "of": len(events),
             "keeps": "most_recent",
         }
+        if dropped:
+            out["truncation"]["dropped_for_size"] = dropped
+    if clipped:
+        out["truncation"] = out.get("truncation") or {
+            "kept": len(dicts),
+            "of": len(events),
+            "keeps": "most_recent",
+        }
+        out["truncation"]["messages_clipped"] = clipped
     return out
+
+
+def _fit_events(events: list[Event]) -> tuple[list[dict], int, int]:
+    """Serialize events within `_MAX_RESPONSE_BYTES`.
+
+    Returns (dicts, messages_clipped, events_dropped). Long messages are clipped
+    first because a single payload dump can be tens of kilobytes; only if that is
+    not enough are whole events dropped, oldest first, since recency is what
+    matters for an incident.
+    """
+    clipped = 0
+    dicts = []
+    for e in events:
+        d = e.to_dict()
+        msg = d.get("message")
+        if msg is not None and len(msg) > _MAX_EVENT_MESSAGE:
+            d["message"] = msg[:_MAX_EVENT_MESSAGE] + "…[clipped]"
+            clipped += 1
+        dicts.append(d)
+
+    dropped = 0
+    # Cheap length proxy avoids re-serializing the whole list on every step.
+    def size(ds: list[dict]) -> int:
+        return sum(len(str(d)) for d in ds) + 2 * len(ds)
+
+    while dicts and size(dicts) > _MAX_RESPONSE_BYTES:
+        # Drop from the front: oldest first, keep the most recent.
+        step = max(1, len(dicts) // 20)
+        del dicts[:step]
+        dropped += step
+    return dicts, clipped, dropped
 
 
 def get_install_log(

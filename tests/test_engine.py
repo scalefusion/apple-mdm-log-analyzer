@@ -2792,6 +2792,100 @@ def test_mdm_server_url_is_not_returned_in_cleartext():
     assert "<redacted-path>" in scep
 
 
+
+def test_query_events_response_fits_the_transport():
+    # query_events capped the event COUNT but never the byte size — the one
+    # response path with no byte discipline, while _MAX_PHASES,
+    # _MAX_TIMELINE_EVENTS and MAX_EVIDENCE all exist because of the 1 MB MCP
+    # limit. At the 5000-event ceiling with realistic ~3 KB payload-dump lines
+    # the response measured 15.4 MB, which the transport refuses outright.
+    import json as _json
+
+    big = "PayloadContent = ( { Data = " + "Q" * 2900 + "; } );"
+    lines = [
+        _json.dumps(
+            {
+                # Microseconds, so timestamps are strictly monotonic — with
+                # `i % 60` for the minute they are not, and "the newest event
+                # survives" cannot be asserted.
+                "timestamp": f"2026-08-24 10:00:00.{i:06d}+0530",
+                "processImagePath": "/usr/libexec/mdmclient",
+                "subsystem": "com.apple.ManagedClient",
+                "messageType": "Default",
+                "eventMessage": big,
+                "traceID": f"t{i}",
+                "machTimestamp": i,
+            }
+        )
+        for i in range(5200)
+    ]
+    src = FixtureLogSource(_write_fixture(lines), os_major=26)
+    res = engine.query_events(src, "mdm_command", last="1h", limit=5000)
+
+    assert len(_json.dumps(res)) < 1_000_000, len(_json.dumps(res))
+    # The true total is still reported — the cap must never hide the scale.
+    assert res["count"] == 5200
+    t = res["truncation"]
+    assert t["keeps"] == "most_recent"
+    assert t["messages_clipped"] > 0
+    assert t["dropped_for_size"] > 0
+    assert t["kept"] == len(res["events"])
+    # Recency is what matters for an incident: the newest event survives.
+    assert res["events"][-1]["raw_ref"].startswith("t5199")
+
+
+def test_archive_extraction_is_bounded_and_reused():
+    # Neither extraction guard looked at UNCOMPRESSED size, and each open_archive
+    # on the same path extracted a fresh copy retained until process exit. A
+    # well-formed 538 KB tarball expanded to 188 MB, and three calls held 564 MB.
+    # An MCP server lives as long as the client session.
+    import io as _io
+    import json as _json
+    import tarfile as _tarfile
+
+    from mdm_log_analyzer import sources as _sources
+
+    # The budget refuses before writing anything, so it is unit-tested on the
+    # accumulator rather than by generating a multi-gigabyte fixture.
+    total = 0
+    refused = False
+    try:
+        for i in range(20):
+            total = _sources._check_extract_budget(total, 200 * 1024 * 1024, f"m{i}")
+    except _sources.ExtractionTooLarge:
+        refused = True
+    assert refused, "budget never fired"
+    assert total <= _sources._MAX_EXTRACT_BYTES
+
+    # Repeat opens of one path reuse the extraction.
+    with tempfile.TemporaryDirectory() as td:
+        tar = Path(td) / "bundle.tar.gz"
+        line = _json.dumps(
+            {
+                "timestamp": "2026-08-24 10:00:00.000000+0530",
+                "processImagePath": "/usr/libexec/mdmclient",
+                "eventMessage": "hello",
+                "traceID": "t1",
+                "machTimestamp": 1,
+            }
+        ).encode()
+        with _tarfile.open(tar, "w:gz") as tf:
+            for name, data in (
+                ("os.txt", b"ProductName:\tmacOS\nProductVersion:\t26.0\n"),
+                ("mdmclient.ndjson", line),
+            ):
+                ti = _tarfile.TarInfo("mdm-logs-x/" + name)
+                ti.size = len(data)
+                tf.addfile(ti, _io.BytesIO(data))
+
+        before = len(_sources._EXTRACTED_TEMP_DIRS)
+        a = _sources.open_archive_source(str(tar))
+        b = _sources.open_archive_source(str(tar))
+        c = _sources.open_archive_source(str(tar))
+        assert len(_sources._EXTRACTED_TEMP_DIRS) - before == 1, "re-extracted"
+        assert a.bundle_dir == b.bundle_dir == c.bundle_dir
+
+
 if __name__ == "__main__":
     import traceback
 

@@ -541,6 +541,24 @@ def _looks_like_bundle(d: Path) -> bool:
 # Extraction cleanup — per-process temp dirs, removed at exit so we stay stateless.
 _EXTRACTED_TEMP_DIRS: list[str] = []
 
+# Ceiling on UNCOMPRESSED bytes written by one extraction. Neither guard below
+# looked at expanded size, so a well-formed 538 KB tarball (valid os.txt, valid
+# NDJSON — nothing a shape check rejects) expanded to 188 MB, and every
+# open_archive call on the same path extracted a fresh copy retained until the
+# process exits. An MCP server lives as long as the client session, so three
+# calls filled 564 MB in half a second. No malice needed either: the engine's own
+# comments cite a real 205 MB bundle, and a model retrying open_archive does
+# exactly this. 1 GiB is generous for a log bundle and still bounded.
+_MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
+
+# Extraction results, keyed by resolved source path, so repeat opens reuse the
+# directory instead of duplicating it.
+_EXTRACTED_BY_PATH: dict[str, Path] = {}
+
+
+class ExtractionTooLarge(ValueError):
+    """Raised when an archive expands past _MAX_EXTRACT_BYTES."""
+
 
 def _cleanup_extracted_dirs():
     for d in _EXTRACTED_TEMP_DIRS:
@@ -553,6 +571,9 @@ atexit.register(_cleanup_extracted_dirs)
 def _safe_extract_tarball(tar_path: Path) -> Path:
     """Extract a bundle tarball into a per-process temp dir with path-traversal
     guards, and return the extracted top-level bundle directory."""
+    cached = _EXTRACTED_BY_PATH.get(str(tar_path.resolve()))
+    if cached is not None and cached.exists():
+        return cached
     tmp = tempfile.mkdtemp(prefix="mdm-log-analyzer-bundle-")
     _EXTRACTED_TEMP_DIRS.append(tmp)
     tmp_root = Path(tmp).resolve()
@@ -583,6 +604,13 @@ def _safe_extract_tarball(tar_path: Path) -> Path:
                     raise ValueError(
                         f"unsafe tarball link: {member.name} -> {member.linkname}"
                     )
+        # Refuse before writing anything: the member headers declare the
+        # uncompressed size, so a compression bomb is rejected without touching
+        # the disk.
+        total = 0
+        for member in tf.getmembers():
+            if member.isreg():
+                total = _check_extract_budget(total, member.size, member.name)
         # Belt and braces: tarfile's own 'data' filter rejects absolute links,
         # device nodes and setuid bits too. It arrived in 3.12 and was backported
         # to 3.11.4 (PEP 706), so feature-detect rather than assume — the
@@ -595,7 +623,20 @@ def _safe_extract_tarball(tar_path: Path) -> Path:
             tf.extractall(tmp)
     # Find the bundle root — usually the single top-level directory produced
     # by collect-mdm-logs.sh (mdm-logs-<host>/).
-    return _find_bundle_root(Path(tmp), tar_path.name)
+    root = _find_bundle_root(Path(tmp), tar_path.name)
+    _EXTRACTED_BY_PATH[str(tar_path.resolve())] = root
+    return root
+
+
+def _check_extract_budget(total: int, added: int, name: str) -> int:
+    """Accumulate uncompressed bytes and refuse to blow the budget."""
+    total += max(0, added)
+    if total > _MAX_EXTRACT_BYTES:
+        raise ExtractionTooLarge(
+            f"archive expands past {_MAX_EXTRACT_BYTES // (1024 * 1024)} MiB "
+            f"(at member {name!r}); refusing to extract"
+        )
+    return total
 
 
 def _safe_extract_zip(zip_path: Path) -> Path:
@@ -607,6 +648,9 @@ def _safe_extract_zip(zip_path: Path) -> Path:
     file and users fell back to attaching it to the chat, which skips redaction
     entirely (see README "Attach vs open_archive").
     """
+    cached = _EXTRACTED_BY_PATH.get(str(zip_path.resolve()))
+    if cached is not None and cached.exists():
+        return cached
     tmp = tempfile.mkdtemp(prefix="mdm-log-analyzer-bundle-")
     _EXTRACTED_TEMP_DIRS.append(tmp)
     tmp_root = Path(tmp).resolve()
@@ -620,12 +664,16 @@ def _safe_extract_zip(zip_path: Path) -> Path:
             # Finder stores resource forks in __MACOSX/; they are not bundle content.
             if not n.startswith("__MACOSX/") and not Path(n).name.startswith("._")
         ]
+        total = 0
         for name in members:
             target = (tmp_root / name).resolve()
             if not _within(tmp_root, target):
                 raise ValueError(f"unsafe zip member: {name}")
+            total = _check_extract_budget(total, zf.getinfo(name).file_size, name)
         zf.extractall(tmp, members=members)
-    return _find_bundle_root(Path(tmp), zip_path.name)
+    root = _find_bundle_root(Path(tmp), zip_path.name)
+    _EXTRACTED_BY_PATH[str(zip_path.resolve())] = root
+    return root
 
 
 def _find_bundle_root(tmp: Path, label: str) -> Path:
