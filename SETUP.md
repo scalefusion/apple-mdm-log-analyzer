@@ -1,6 +1,6 @@
 # Setup guide — MDM/DDM Log Analyzer
 
-A step-by-step guide for **Mac admins and QA** to get the analyzer running on
+A step-by-step guide for **Mac admins** to get the analyzer running on
 their machine, wire it into an MCP-capable client, and run their first analysis
 against either live logs or a bundle collected from another Mac.
 
